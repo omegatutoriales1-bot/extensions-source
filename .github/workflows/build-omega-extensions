@@ -1,0 +1,86 @@
+name: Build Omega Extensions
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+    paths:
+      - "src/es/lectorxd/**"
+      - "src/es/lectorotaku/**"
+      - "scripts/fetch_site_icons.py"
+      - ".github/workflows/build-omega-extensions.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Omega Extensions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle executable
+        run: chmod +x gradlew
+
+      - name: Download site icons
+        run: |
+          python scripts/fetch_site_icons.py
+
+      - name: Format LectorXD Kotlin
+        run: |
+          ./gradlew :src:es:lectorxd:spotlessKotlinApply --stacktrace
+
+      - name: Format LectorOtaku Kotlin
+        run: |
+          ./gradlew :src:es:lectorotaku:spotlessKotlinApply --stacktrace
+
+      - name: Build LectorXD APK
+        run: |
+          ./gradlew :src:es:lectorxd:assembleDebug --stacktrace
+
+      - name: Build LectorOtaku APK
+        run: |
+          ./gradlew :src:es:lectorotaku:assembleDebug --stacktrace
+
+      - name: Show generated APKs
+        run: |
+          echo "===== LectorXD ====="
+          find src/es/lectorxd/build -type f -name "*.apk" -print || true
+
+          echo "===== LectorOtaku ====="
+          find src/es/lectorotaku/build -type f -name "*.apk" -print || true
+
+      - name: Upload LectorXD APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LectorXD-Mihon-APK
+          path: src/es/lectorxd/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload LectorOtaku APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LectorOtaku-Mihon-APK
+          path: src/es/lectorotaku/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
