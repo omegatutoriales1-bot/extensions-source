@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.es.lectorxd
 
+import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -10,6 +11,7 @@ import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
 import keiyoushi.network.get
 import keiyoushi.source.KeiSource
+import kotlinx.serialization.json.JsonElement
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -23,6 +25,8 @@ import java.util.Locale
 
 @Source
 abstract class LectorXD : KeiSource() {
+
+    private val statusQueryCache = mutableMapOf<String, Pair<String, String>>()
 
     override fun Headers.Builder.configureHeaders(): Headers.Builder = apply {
         set("User-Agent", DESKTOP_UA)
@@ -50,6 +54,13 @@ abstract class LectorXD : KeiSource() {
         }
     }
 
+    override fun getFilterList(data: JsonElement?): FilterList = FilterList(
+        Filter.Header("Filtros de LectorXD"),
+        StatusFilter(),
+        TypeFilter(),
+        CategoryFilter(),
+    )
+
     override suspend fun getPopularManga(page: Int): MangasPage {
         // LectorXD exposes its catalogue as the most stable paginated entry point.
         // "sort" is harmless on deployments that ignore it and works on deployments
@@ -70,17 +81,24 @@ abstract class LectorXD : KeiSource() {
         query: String,
         filters: FilterList,
     ): MangasPage {
-        if (query.isBlank()) return getPopularManga(page)
+        val selectedStatus = filters.filterIsInstance<StatusFilter>()
+            .firstOrNull()
+            ?.selectedValue
+            .orEmpty()
+        val statusQuery = selectedStatus
+            .takeIf { it.isNotEmpty() }
+            ?.let { resolveStatusQuery(it) }
 
-        // The frontend has changed its search parameter in the past. Trying a few
-        // conventional names makes the extension tolerant to that without depending
-        // on volatile CSS/JS implementation details.
+        if (query.isBlank()) {
+            val document = client.get(filteredCatalogueUrl(page, filters, statusQuery)).asJsoup()
+            return document.toMangasPage(page)
+        }
+
         for (parameter in SEARCH_PARAMETERS) {
             val result = runCatching {
-                val url = "$baseUrl/catalogo".toHttpUrl().newBuilder()
-                    .addQueryParameter("filters", "true")
+                val url = filteredCatalogueUrl(page, filters, statusQuery)
+                    .newBuilder()
                     .addQueryParameter(parameter, query)
-                    .addQueryParameter("page", page.toString())
                     .build()
                 val document = client.get(url).asJsoup()
                 val mangas = parseCatalogue(document)
@@ -96,7 +114,6 @@ abstract class LectorXD : KeiSource() {
             if (result != null) return result
         }
 
-        // Last fallback: some versions expose a dedicated search route.
         for (route in SEARCH_ROUTES) {
             val result = runCatching {
                 val url = "$baseUrl$route".toHttpUrl().newBuilder()
@@ -178,6 +195,68 @@ abstract class LectorXD : KeiSource() {
             addQueryParameter("page", page.toString())
             sort?.let { addQueryParameter("sort", it) }
         }.build()
+
+    private fun filteredCatalogueUrl(
+        page: Int,
+        filters: FilterList,
+        statusQuery: Pair<String, String>?,
+    ): HttpUrl = "$baseUrl/catalogo".toHttpUrl().newBuilder().apply {
+        addQueryParameter("filters", "true")
+        addQueryParameter("page", page.toString())
+
+        filters.filterIsInstance<TypeFilter>()
+            .firstOrNull()
+            ?.selectedValue
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { addQueryParameter("types", it) }
+
+        filters.filterIsInstance<CategoryFilter>()
+            .firstOrNull()
+            ?.selectedValue
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { addQueryParameter("tags", it) }
+
+        statusQuery?.let { (name, value) ->
+            addQueryParameter(name, value)
+        }
+    }.build()
+
+    private suspend fun resolveStatusQuery(status: String): Pair<String, String> {
+        statusQueryCache[status]?.let { return it }
+
+        val candidates = STATUS_QUERY_CANDIDATES[status].orEmpty()
+        if (candidates.isEmpty()) return "status" to status
+
+        val baseCount = runCatching {
+            catalogueTotal(client.get(catalogueUrl(1)).asJsoup())
+        }.getOrNull()
+
+        if (baseCount != null && baseCount > 0) {
+            for (candidate in candidates) {
+                val count = runCatching {
+                    val url = catalogueUrl(1).newBuilder()
+                        .addQueryParameter(candidate.first, candidate.second)
+                        .build()
+                    catalogueTotal(client.get(url).asJsoup())
+                }.getOrNull()
+
+                if (count != null && count in 1 until baseCount) {
+                    statusQueryCache[status] = candidate
+                    return candidate
+                }
+            }
+        }
+
+        return candidates.first().also { statusQueryCache[status] = it }
+    }
+
+    private fun catalogueTotal(document: Document): Int? {
+        val raw = CATALOGUE_TOTAL_REGEX.find(document.text())
+            ?.groupValues
+            ?.getOrNull(1)
+            ?: return null
+        return raw.filter(Char::isDigit).toIntOrNull()
+    }
 
     private fun Document.toMangasPage(page: Int): MangasPage =
         MangasPage(parseCatalogue(this), hasNextPage(this, page))
@@ -394,6 +473,22 @@ abstract class LectorXD : KeiSource() {
         private val SEARCH_PARAMETERS = listOf("search", "q", "query", "title")
         private val SEARCH_ROUTES = listOf("/buscar", "/search")
 
+        private val STATUS_QUERY_CANDIDATES = mapOf(
+            "ongoing" to listOf(
+                "status" to "ongoing",
+                "statuses" to "ongoing",
+                "status" to "en-emision",
+                "status" to "emision",
+            ),
+            "completed" to listOf(
+                "status" to "completed",
+                "statuses" to "completed",
+                "status" to "completado",
+            ),
+        )
+
+        private val CATALOGUE_TOTAL_REGEX = Regex("([0-9.,]+)\\s+series disponibles", RegexOption.IGNORE_CASE)
+
         private val SERIES_PATH_REGEX = Regex("^/(?:manga|manhwa|manhua|novela|one-shot)/[^/?#]+$", RegexOption.IGNORE_CASE)
         private val CHAPTER_PATH_REGEX = Regex("^((?:/manga|/manhwa|/manhua|/novela|/one-shot)/[^/?#]+)/leer/[^/?#]+$", RegexOption.IGNORE_CASE)
         private val CHAPTER_NUMBER_REGEX = Regex("(?:Cap(?:ítulo)?\\.?\\s*)?([0-9]+(?:\\.[0-9]+)?)", RegexOption.IGNORE_CASE)
@@ -402,3 +497,55 @@ abstract class LectorXD : KeiSource() {
         private val CDN_IMAGE_REGEX = Regex("https://s[12]\\.cdnlxd\\.xyz/[^\\\"'<>\\s]+", RegexOption.IGNORE_CASE)
     }
 }
+
+
+private open class LectorXDSelectFilter(
+    name: String,
+    private val values: Array<Pair<String, String>>,
+) : Filter.Select<String>(name, values.map { it.first }.toTypedArray()) {
+    val selectedValue: String
+        get() = values[state].second
+}
+
+private class StatusFilter : LectorXDSelectFilter(
+    "Estado",
+    arrayOf(
+        "Todos" to "",
+        "En emisión" to "ongoing",
+        "Completado" to "completed",
+    ),
+)
+
+private class TypeFilter : LectorXDSelectFilter(
+    "Tipo",
+    arrayOf(
+        "Todos" to "",
+        "Manga" to "manga",
+        "Manhwa" to "manhwa",
+        "Manhua" to "manhua",
+        "Novela" to "novela",
+        "One Shot" to "one-shot",
+    ),
+)
+
+private class CategoryFilter : LectorXDSelectFilter(
+    "Categoría",
+    arrayOf(
+        "Todas" to "",
+        "Romance" to "27",
+        "Drama" to "30",
+        "Acción" to "23",
+        "Fantasía" to "24",
+        "Comedia" to "28",
+        "Aventura" to "25",
+        "Ecchi" to "33",
+        "Harem" to "21",
+        "Recuentos de la vida" to "35",
+        "Artes Marciales" to "54",
+        "Reencarnación" to "29",
+        "Sobrenatural" to "36",
+        "Magia" to "48",
+        "Tragedia" to "46",
+        "Academia" to "53",
+    ),
+)
